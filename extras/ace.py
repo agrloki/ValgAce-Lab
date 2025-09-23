@@ -1,4 +1,4 @@
-# File: ace.py — ValgAce module for Klipper
+# ValgAce module for Klipper
 
 import os
 import serial
@@ -13,6 +13,9 @@ from contextlib import contextmanager
 
 
 class ValgAce:
+    PARK_TIMEOUT = 30.0  # seconds
+    REQUEST_TIMEOUT = 5.0  # seconds
+
     def __init__(self, config):
         self.printer = config.get_printer()
         self.toolhead = None
@@ -43,7 +46,7 @@ class ValgAce:
         self.park_hit_count = config.getint('park_hit_count', 5)
         self.max_dryer_temperature = config.getint('max_dryer_temperature', 55)
         self.disable_assist_after_toolchange = config.getboolean('disable_assist_after_toolchange', True)
-        self.infinity_spool_mode = config.getboolean ('infinity_spool_mode', False)
+        self.infinity_spool_mode = config.getboolean('infinity_spool_mode', False)
 
         # Состояние устройства
         self._info = self._get_default_info()
@@ -61,6 +64,11 @@ class ValgAce:
         self._park_is_toolchange = False
         self._park_previous_tool = -1
         self._park_index = -1
+        self._park_start_time = 0.0
+
+        # Таймеры для таймаутов
+        self._park_timeout_timer = None
+        self._request_timeout_timers = {}
 
         # Очереди
         self._queue = queue.Queue(maxsize=self._max_queue_size)
@@ -77,6 +85,7 @@ class ValgAce:
 
         # Подключение при запуске
         self.reactor.register_timer(self._connect_check, self.reactor.NOW)
+        self.reactor.register_timer(self._main_eval, self.reactor.NOW)
 
     def _get_default_info(self) -> Dict[str, Any]:
         return {
@@ -121,7 +130,7 @@ class ValgAce:
             ('ACE_UPDATE_RETRACT_SPEED', self.cmd_ACE_UPDATE_RETRACT_SPEED, "Update retracting speed"),
             ('ACE_STOP_RETRACT', self.cmd_ACE_STOP_RETRACT, "Stop retract filament"),
             ('ACE_CHANGE_TOOL', self.cmd_ACE_CHANGE_TOOL, "Change tool"),
-            ('ACE_INFINITY_SPOOL', self.cmd_ACE_INFINITY_SPOOL, "Change tool whel current spool is empty"),
+            ('ACE_INFINITY_SPOOL', self.cmd_ACE_INFINITY_SPOOL, "Use next ready spool"),
             ('ACE_FILAMENT_INFO', self.cmd_ACE_FILAMENT_INFO, "Show filament info"),
         ]
         for name, func, desc in commands:
@@ -165,9 +174,11 @@ class ValgAce:
                     print(f"Connected to ACE at {self.serial_name}")
 
                     def info_callback(response):
-                        res = response['result']
-                        print(f"Device info: {res.get('model', 'Unknown')} {res.get('firmware', 'Unknown')}")
-                        self.gcode.respond_info(f"Connected {res.get('model', 'Unknown')} {res.get('firmware', 'Unknown')}")
+                        res = response.get('result', {})
+                        model = res.get('model', 'Unknown')
+                        firmware = res.get('firmware', 'Unknown')
+                        print(f"Device info: {model} {firmware}")
+                        self.gcode.respond_info(f"Connected {model} {firmware}")
 
                     self.send_request({"method": "get_info"}, info_callback)
 
@@ -198,6 +209,14 @@ class ValgAce:
         except Exception as e:
             print(f"Disconnect error: {str(e)}")
 
+        # Отменить все таймауты
+        if self._park_timeout_timer:
+            self.reactor.unregister_timer(self._park_timeout_timer)
+            self._park_timeout_timer = None
+        for timer in self._request_timeout_timers.values():
+            self.reactor.unregister_timer(timer)
+        self._request_timeout_timers.clear()
+
     def _handle_ready(self):
         self.toolhead = self.printer.lookup_object('toolhead')
         if self.toolhead is None:
@@ -227,11 +246,28 @@ class ValgAce:
         request['id'] = self._get_next_request_id()
         self._queue.put((request, callback))
 
+        # Установка таймаута на ответ
+        req_id = request['id']
+        timer = self.reactor.register_timer(
+            lambda et: self._on_request_timeout(req_id),
+            self.reactor.monotonic() + self.REQUEST_TIMEOUT
+        )
+        self._request_timeout_timers[req_id] = timer
+
     def _get_next_request_id(self) -> int:
         self._request_id += 1
         if self._request_id >= 300000:
             self._request_id = 0
         return self._request_id
+
+    def _on_request_timeout(self, req_id):
+        cb = self._callback_map.pop(req_id, None)
+        if cb:
+            try:
+                cb({'error': 'Request timeout', 'id': req_id})
+            except:
+                pass
+        self._request_timeout_timers.pop(req_id, None)
 
     def _send_request(self, request: Dict[str, Any]) -> bool:
         try:
@@ -328,27 +364,29 @@ class ValgAce:
         def status_callback(response):
             if 'result' in response:
                 self._info.update(response['result'])
-        if self.reactor.monotonic() - self._last_status_request > (0.2 if self._park_in_progress else 1.0):
-            try:
-                self.send_request({
-                    "id": self._get_next_request_id(),
-                    "method": "get_status"
-                }, status_callback)
-                self._last_status_request = self.reactor.monotonic()
-            except Exception as e:
-                print(f"Status request error: {str(e)}")
+        now = self.reactor.monotonic()
+        if now - self._last_status_request > (0.2 if self._park_in_progress else 1.0):
+            self.send_request({"method": "get_status"}, status_callback)
+            self._last_status_request = now
 
     def _handle_response(self, response: dict):
-        if 'id' in response:
-            callback = self._callback_map.pop(response['id'], None)
+        req_id = response.get('id')
+        if req_id is not None:
+            # Отменяем таймаут
+            timer = self._request_timeout_timers.pop(req_id, None)
+            if timer:
+                self.reactor.unregister_timer(timer)
+            callback = self._callback_map.pop(req_id, None)
             if callback:
                 try:
                     callback(response)
                 except Exception as e:
                     print(f"Callback error: {str(e)}")
+
         if 'result' in response and isinstance(response['result'], dict):
             result = response['result']
             self._info.update(result)
+
             if self._park_in_progress:
                 current_status = result.get('status', 'unknown')
                 current_assist_count = result.get('feed_assist_count', 0)
@@ -359,23 +397,35 @@ class ValgAce:
                     else:
                         self._assist_hit_count += 1
                         if self._assist_hit_count >= self.park_hit_count:
-                            self._complete_parking()
+                            self._complete_parking(success=True)
                             return
-                    self.dwell(0.7, lambda: None)
+                # Обновляем таймер парковки
+                now = self.reactor.monotonic()
+                if now - self._park_start_time > self.PARK_TIMEOUT:
+                    self._complete_parking(success=False, error="Parking timeout")
 
-    def _complete_parking(self):
+    def _start_park_timeout(self):
+        def timeout_handler(eventtime):
+            if self._park_in_progress:
+                self._complete_parking(success=False, error="Parking timeout")
+            return self.reactor.NEVER
+        self._park_timeout_timer = self.reactor.register_timer(timeout_handler, self.reactor.NOW + self.PARK_TIMEOUT)
+
+    def _complete_parking(self, success=True, error=None):
         if not self._park_in_progress:
             return
-        print(f"Parking completed for slot {self._park_index}")
+        if self._park_timeout_timer:
+            self.reactor.unregister_timer(self._park_timeout_timer)
+            self._park_timeout_timer = None
+
+        print(f"Parking completed for slot {self._park_index} (success={success})")
         try:
-            self.send_request({
-                "method": "stop_feed_assist",
-                "params": {"index": self._park_index}
-            }, lambda r: None)
-            # if self._park_is_toolchange:
-            #     self.gcode.run_script_from_command(
-            #         f'_ACE_POST_TOOLCHANGE FROM={self._park_previous_tool} TO={self._park_index}'
-            #     )
+            if success:
+                self.send_request({
+                    "method": "stop_feed_assist",
+                    "params": {"index": self._park_index}
+                }, lambda r: None)
+            # Post-toolchange вызывается в cmd_ACE_CHANGE_TOOL
         except Exception as e:
             print(f"Parking completion error: {str(e)}")
         finally:
@@ -400,10 +450,10 @@ class ValgAce:
 
         self.reactor.register_timer(timer_handler, self.reactor.monotonic() + delay)
 
-    def pdwell(self, delay = 1.):
+    def pdwell(self, delay):
         currTs = self.reactor.monotonic()
         self.reactor.pause(currTs + delay)
-        
+
     def _main_eval(self, eventtime):
         while not self._main_queue.empty():
             try:
@@ -462,10 +512,10 @@ class ValgAce:
                     gcmd.respond_info("\n".join(output))
                 else:
                     gcmd.respond_info(json.dumps(response, indent=2))
+            self.send_request(request, callback)
         except Exception as e:
             print(f"Debug command error: {str(e)}")
             gcmd.respond_raw(f"Error: {str(e)}")
-        self.send_request(request, callback)
 
     def cmd_ACE_FILAMENT_INFO(self, gcmd):
         index = gcmd.get_int('INDEX', minval=0, maxval=3)
@@ -529,14 +579,23 @@ class ValgAce:
         self.send_request({"method": "stop_feed_assist", "params": {"index": index}}, callback)
 
     def _park_to_toolhead(self, index: int):
+        if self._park_in_progress:
+            print("Attempt to park while already parking")
+            return
+        self._park_in_progress = True
+        self._park_index = index
+        self._assist_hit_count = 0
+        self._park_start_time = self.reactor.monotonic()
+        self._start_park_timeout()
+
         def callback(response):
             if response.get('code', 0) != 0:
-                raise ValueError(f"ACE Error: {response.get('msg', 'Unknown error')}")
-            self._assist_hit_count = 0
-            self._last_assist_count = response.get('result', {}).get('feed_assist_count', 0)
-            self._park_in_progress = True
-            self._park_index = index
-            self.dwell(0.3, lambda: None)
+                err_msg = response.get('msg', 'Unknown error')
+                self._complete_parking(success=False, error=f"ACE Error: {err_msg}")
+                return
+            result = response.get('result', {})
+            self._last_assist_count = result.get('feed_assist_count', 0)
+
         self.send_request({"method": "start_feed_assist", "params": {"index": index}}, callback)
 
     def cmd_ACE_PARK_TO_TOOLHEAD(self, gcmd):
@@ -584,7 +643,7 @@ class ValgAce:
         self.send_request({
             "method": "stop_feed_filament",
             "params": {"index": index},
-            },callback)
+        }, callback)
         self.dwell(0.5, lambda: None)
 
     def cmd_ACE_RETRACT(self, gcmd):
@@ -599,7 +658,7 @@ class ValgAce:
             "method": "unwind_filament",
             "params": {"index": index, "length": length, "speed": speed, "mode": mode}
         }, callback)
-        self.pdwell((length / speed) + 0.1)
+        self.dwell((length / speed) + 0.1, lambda: None)
 
     def cmd_ACE_UPDATE_RETRACT_SPEED(self, gcmd):
         index = gcmd.get_int('INDEX', minval=0, maxval=3)
@@ -619,11 +678,11 @@ class ValgAce:
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
             else:
-                gcmd.respond_info("Feed stopped")
+                gcmd.respond_info("Retract stopped")
         self.send_request({
             "method": "stop_unwind_filament",
             "params": {"index": index},
-            },callback)
+        }, callback)
         self.dwell(0.5, lambda: None)
 
     def cmd_ACE_CHANGE_TOOL(self, gcmd):
@@ -641,6 +700,11 @@ class ValgAce:
         self.gcode.run_script_from_command(f"_ACE_PRE_TOOLCHANGE FROM={was} TO={tool}")
         self._park_is_toolchange = True
         self._park_previous_tool = was
+
+        if self.toolhead is None:
+            gcmd.respond_raw("Toolhead not ready")
+            return
+
         self.toolhead.wait_moves()
         self.variables['ace_current_index'] = tool
         self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={tool}')
@@ -648,6 +712,7 @@ class ValgAce:
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
+
         if was != -1:
             self.send_request({
                 "method": "unwind_filament",
@@ -657,32 +722,24 @@ class ValgAce:
                     "speed": self.retract_speed
                 }
             }, callback)
-            self.pdwell((self.toolchange_retract_length / self.retract_speed) + 0.1)
-            self.pdwell(1.0)
+            self.dwell((self.toolchange_retract_length / self.retract_speed) + 0.1, lambda: None)
+            self.dwell(1.0, lambda: None)
+
             if tool != -1:
-                while self._info['slots'][was]['status'] != 'ready':
-                    self.pdwell(1.0)
-                self.gcode.run_script_from_command(f'ACE_PARK_TO_TOOLHEAD INDEX={tool}')
-                self.toolhead.wait_moves()
-                self.pdwell(10.0)
-                # while not self._park_in_progress :
-                #     gcmd.respond_info(f"Park in progress")
-                #     self.pdwell(5.0)
-                self.gcode.run_script_from_command(f'_ACE_POST_TOOLCHANGE FROM={was} TO={tool}')
-                self.toolhead.wait_moves()
-                gcmd.respond_info(f"Tool changed from {was} to {tool}")
+                # Ждём готовности старого слота
+                self._wait_for_slot_ready(was, lambda: self._proceed_with_toolchange(tool, was, gcmd), self.reactor.NOW)
             else:
-                self.gcode.run_script_from_command(f'_ACE_POST_TOOLCHANGE FROM={was} TO={tool}')
-                self.toolhead.wait_moves()
-                gcmd.respond_info(f"Tool changed from {was} to {tool}")
+                self._proceed_with_toolchange(tool, was, gcmd)
         else:
             self._park_to_toolhead(tool)
-            self.pdwell(15.0)
-            self.gcode.run_script_from_command(f'_ACE_POST_TOOLCHANGE FROM={was} TO={tool}')
-            self.toolhead.wait_moves()
-            self.variables['ace_current_index'] = tool
-            gcmd.respond_info(f"Tool changed from {was} to {tool}")
-            
+
+    def _proceed_with_toolchange(self, tool, was, gcmd):
+        self._park_to_toolhead(tool)
+        self.dwell(15.0, lambda: None)
+        self.gcode.run_script_from_command(f'_ACE_POST_TOOLCHANGE FROM={was} TO={tool}')
+        self.toolhead.wait_moves()
+        gcmd.respond_info(f"Tool changed from {was} to {tool}")
+
     def _wait_for_slot_ready(self, index, on_ready, event_time):
         if self._info['slots'][index]['status'] == 'ready':
             on_ready()
@@ -690,57 +747,35 @@ class ValgAce:
         return event_time + 0.5
 
     def cmd_ACE_INFINITY_SPOOL(self, gcmd):
+        if not self.infinity_spool_mode:
+            gcmd.respond_info("ACE_INFINITY_SPOOL disabled")
+            return
         was = self.variables.get('ace_current_index', -1)
-        infsp_status = self.infinity_spool_mode
-        infsp_count = self.variables.get('ace_infsp_counter', 1)
-        
-        if infsp_status != True :
-            gcmd.respond_info(f"ACE_INFINITY_SPOOL disabled")
-            gcmd.respond_info(f"ACE_INFINITY_SPOOL dstatus {infsp_status}")
-            return
         if was == -1:
-            gcmd.respond_info(f"Tool is not set")
+            gcmd.respond_info("Tool is not set")
             return
-        if infsp_count >= 4:
-            gcmd.respond_info(f"No more ready spoll")
+
+        # Найти следующий доступный слот
+        next_tool = None
+        for i in range(4):
+            if i != was and self._info['slots'][i]['status'] == 'ready':
+                next_tool = i
+                break
+        if next_tool is None:
+            gcmd.respond_info("No ready spool available")
             return
-        
+
         self.gcode.run_script_from_command(f"_ACE_PRE_INFINITYSPOOL")
+        if self.toolhead:
+            self.toolhead.wait_moves()
+
+        self._park_to_toolhead(next_tool)
+        self.dwell(15.0, lambda: None)
+        self.gcode.run_script_from_command(f'__ACE_POST_INFINITYSPOOL')
         self.toolhead.wait_moves()
-        
-        if infsp_count == 1:
-                tool = infsp_count
-                self.gcode.run_script_from_command(f'ACE_PARK_TO_TOOLHEAD INDEX={tool}')
-                self.pdwell(15.0)
-                self.gcode.run_script_from_command(f'__ACE_POST_INFINITYSPOOL')
-                self.toolhead.wait_moves()
-                self.variables['ace_current_index'] = tool
-                self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={tool}')
-                self.variables['ace_infsp_counter'] = 2
-                self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_infsp_counter VALUE=2')
-                gcmd.respond_info(f"Tool changed from {was} to {tool}")
-        elif infsp_count == 2:
-                tool = infsp_count
-                self.gcode.run_script_from_command(f'ACE_PARK_TO_TOOLHEAD INDEX={tool}')
-                self.pdwell(15.0)
-                self.gcode.run_script_from_command(f'__ACE_POST_INFINITYSPOOL')
-                self.toolhead.wait_moves()
-                self.variables['ace_current_index'] = tool
-                self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={tool}')
-                self.variables['ace_infsp_counter'] = 3
-                self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_infsp_counter VALUE=3')                                
-                gcmd.respond_info(f"Tool changed from {was} to {tool}")
-        elif infsp_count == 3:
-                tool = infsp_count
-                self.gcode.run_script_from_command(f'ACE_PARK_TO_TOOLHEAD INDEX={tool}')
-                self.pdwell(15.0)
-                self.gcode.run_script_from_command(f'__ACE_POST_INFINITYSPOOL')
-                self.toolhead.wait_moves()
-                self.variables['ace_current_index'] = tool
-                self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={tool}')
-                self.variables['ace_infsp_counter'] = 4
-                self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_infsp_counter VALUE=4')                  
-                gcmd.respond_info(f"Tool changed from {was} to {tool}")
+        self.variables['ace_current_index'] = next_tool
+        self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={next_tool}')
+        gcmd.respond_info(f"Tool changed from {was} to {next_tool}")
 
 
 def load_config(config):
