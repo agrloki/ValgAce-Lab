@@ -7,6 +7,7 @@
 - Команды G-code для подачи/ретракта, парковки, смены инструмента (слота), сушки.
 - Режим Infinity Spool: автоматическая смена на следующий готовый слот.
 - Мульти-девайс конфигурация с глобальными инструментами T0–T7 и маппингом к локальным слотам.
+ - Per-instance команды сушки: `ACE_START_DRYING_<SECTION>`, `ACE_STOP_DRYING_<SECTION>` для явного выбора устройства.
 
 ## Требования
 - Klipper и Moonraker установлены и запущены как systemd-сервисы (`klipper`, `moonraker`).
@@ -150,8 +151,10 @@ ACE_INFINITY_SPOOL
 - Режим бесконечной катушки:
   - `ACE_INFINITY_SPOOL` — переключает на следующий готовый локальный слот устройства, где команда вызвана
 - Сушка:
-  - `ACE_START_DRYING TEMP=<°C> DURATION=<мин>`
-  - `ACE_STOP_DRYING`
+  - `ACE_START_DRYING TEMP=<°C> DURATION=<мин>` — общий вызов (для одного устройства)
+  - `ACE_STOP_DRYING` — общий вызов
+  - `ACE_START_DRYING_<SECTION> TEMP=<°C> DURATION=<мин>` — для конкретной секции (например, `ACE_START_DRYING_ACE`, `ACE_START_DRYING_ACE_SECOND`)
+  - `ACE_STOP_DRYING_<SECTION>` — для конкретной секции
 - Информация о филаменте:
   - `ACE_FILAMENT_INFO INDEX=<0..3>`
 
@@ -205,6 +208,10 @@ ACE_START_DRYING TEMP=55 DURATION=120
 - Infinity Spool на активном устройстве:
 ```gcode
 ACE_INFINITY_SPOOL
+```
+- Сушка на устройстве из секции `[ace second]`:
+```gcode
+ACE_START_DRYING_ACE_SECOND TEMP=55 DURATION=120
 ```
 
 ## Обновления через Moonraker

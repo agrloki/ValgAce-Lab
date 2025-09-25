@@ -93,6 +93,11 @@ class ValgAce:
         self.reactor.register_timer(self._connect_check, self.reactor.NOW)
         self.reactor.register_timer(self._main_eval, self.reactor.NOW)
 
+    def _make_cmd_suffix(self, section_name: str) -> str:
+        # Build a safe uppercase suffix from section name (e.g., "ace second" -> "ACE_SECOND")
+        safe = ''.join(ch if ch.isalnum() else '_' for ch in section_name).upper()
+        return safe
+
     def _get_default_info(self) -> Dict[str, Any]:
         return {
             'status': 'disconnected',
@@ -141,6 +146,16 @@ class ValgAce:
         ]
         for name, func, desc in commands:
             self.gcode.register_command(name, func, desc=desc)
+
+        # Register per-instance namespaced drying commands to disambiguate multiple devices
+        suffix = self._make_cmd_suffix(self._name)
+        if suffix:
+            self.gcode.register_command(
+                f'ACE_START_DRYING_{suffix}', self.cmd_ACE_START_DRYING, desc=f"Start drying ({self._name})"
+            )
+            self.gcode.register_command(
+                f'ACE_STOP_DRYING_{suffix}', self.cmd_ACE_STOP_DRYING, desc=f"Stop drying ({self._name})"
+            )
 
     def _find_ace_device(self) -> Optional[str]:
         ACE_IDS = {
