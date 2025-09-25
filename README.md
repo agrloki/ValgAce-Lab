@@ -87,6 +87,11 @@ tool_slots: 4
 
 Важно: команды с параметром `INDEX` (`ACE_FEED`, `ACE_RETRACT`, `ACE_PARK_TO_TOOLHEAD`, `ENABLE/DISABLE_FEED_ASSIST`, `ACE_STOP_*`, `ACE_UPDATE_*`, `ACE_FILAMENT_INFO`) принимают глобальные индексы (например, 0–7). Модуль сам выберет нужное устройство и преобразует глобальный индекс к локальному слоту.
 
+### Маршрутизация команд
+- Внутри модуля действует глобальный роутер: общие команды `ACE_*` регистрируются один раз и автоматически направляются в нужный инстанс по глобальному `INDEX`/`TOOL`.
+- Если устройств несколько, использовать общие команды безопасно — они сами найдут нужную секцию `[ace …]`.
+- Для сушки дополнительно доступны per-instance команды `ACE_START_DRYING_<SECTION>` / `ACE_STOP_DRYING_<SECTION>` для явного выбора устройства.
+
 ### Примеры для `[ace second]` и типовой `printer.cfg`
 
 Типовая структура `printer.cfg` с двумя устройствами:
@@ -156,7 +161,7 @@ ACE_INFINITY_SPOOL
   - `ACE_START_DRYING_<SECTION> TEMP=<°C> DURATION=<мин>` — для конкретной секции (например, `ACE_START_DRYING_ACE`, `ACE_START_DRYING_ACE_SECOND`)
   - `ACE_STOP_DRYING_<SECTION>` — для конкретной секции
 - Информация о филаменте:
-  - `ACE_FILAMENT_INFO INDEX=<0..3>`
+  - `ACE_FILAMENT_INFO INDEX=<глобальный индекс>`
 
 ### Макросы T0–T7
 В `ace.cfg` уже добавлены:

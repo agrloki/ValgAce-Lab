@@ -1,5 +1,9 @@
 # ValgAce module for Klipper
 
+# Global registry for multi-instance routing
+INSTANCE_REGISTRY = []
+GLOBAL_COMMANDS_REGISTERED = False
+
 import os
 import serial
 import serial.tools.list_ports
@@ -93,6 +97,10 @@ class ValgAce:
         self.reactor.register_timer(self._connect_check, self.reactor.NOW)
         self.reactor.register_timer(self._main_eval, self.reactor.NOW)
 
+        # Register instance for global routing
+        global INSTANCE_REGISTRY
+        INSTANCE_REGISTRY.append(self)
+
     def _make_cmd_suffix(self, section_name: str) -> str:
         # Build a safe uppercase suffix from section name (e.g., "ace second" -> "ACE_SECOND")
         safe = ''.join(ch if ch.isalnum() else '_' for ch in section_name).upper()
@@ -126,26 +134,30 @@ class ValgAce:
         self.printer.register_event_handler('klippy:disconnect', self._handle_disconnect)
 
     def _register_gcode_commands(self):
-        commands = [
-            ('ACE_DEBUG', self.cmd_ACE_DEBUG, "Debug connection"),
-            ('ACE_STATUS', self.cmd_ACE_STATUS, "Get device status"),
-            ('ACE_START_DRYING', self.cmd_ACE_START_DRYING, "Start drying"),
-            ('ACE_STOP_DRYING', self.cmd_ACE_STOP_DRYING, "Stop drying"),
-            ('ACE_ENABLE_FEED_ASSIST', self.cmd_ACE_ENABLE_FEED_ASSIST, "Enable feed assist"),
-            ('ACE_DISABLE_FEED_ASSIST', self.cmd_ACE_DISABLE_FEED_ASSIST, "Disable feed assist"),
-            ('ACE_PARK_TO_TOOLHEAD', self.cmd_ACE_PARK_TO_TOOLHEAD, "Park filament to toolhead"),
-            ('ACE_FEED', self.cmd_ACE_FEED, "Feed filament"),
-            ('ACE_UPDATE_FEEDING_SPEED', self.cmd_ACE_UPDATE_FEEDING_SPEED, "Update feeding speed"),
-            ('ACE_STOP_FEED', self.cmd_ACE_STOP_FEED, "Stop feed filament"),
-            ('ACE_RETRACT', self.cmd_ACE_RETRACT, "Retract filament"),
-            ('ACE_UPDATE_RETRACT_SPEED', self.cmd_ACE_UPDATE_RETRACT_SPEED, "Update retracting speed"),
-            ('ACE_STOP_RETRACT', self.cmd_ACE_STOP_RETRACT, "Stop retract filament"),
-            ('ACE_CHANGE_TOOL', self.cmd_ACE_CHANGE_TOOL, "Change tool"),
-            ('ACE_INFINITY_SPOOL', self.cmd_ACE_INFINITY_SPOOL, "Use next ready spool"),
-            ('ACE_FILAMENT_INFO', self.cmd_ACE_FILAMENT_INFO, "Show filament info"),
-        ]
-        for name, func, desc in commands:
-            self.gcode.register_command(name, func, desc=desc)
+        # Register global router commands only once
+        global GLOBAL_COMMANDS_REGISTERED
+        if not GLOBAL_COMMANDS_REGISTERED:
+            commands = [
+                ('ACE_DEBUG', self.cmd_ACE_DEBUG, "Debug connection"),
+                ('ACE_STATUS', self.cmd_ACE_STATUS, "Get device status"),
+                ('ACE_START_DRYING', self.cmd_ACE_START_DRYING, "Start drying"),
+                ('ACE_STOP_DRYING', self.cmd_ACE_STOP_DRYING, "Stop drying"),
+                # Routed by global index/tool
+                ('ACE_ENABLE_FEED_ASSIST', self.router_ENABLE_FEED_ASSIST, "Enable feed assist (routed)"),
+                ('ACE_DISABLE_FEED_ASSIST', self.router_DISABLE_FEED_ASSIST, "Disable feed assist (routed)"),
+                ('ACE_PARK_TO_TOOLHEAD', self.router_PARK_TO_TOOLHEAD, "Park filament to toolhead (routed)"),
+                ('ACE_FEED', self.router_FEED, "Feed filament (routed)"),
+                ('ACE_UPDATE_FEEDING_SPEED', self.router_UPDATE_FEEDING_SPEED, "Update feeding speed (routed)"),
+                ('ACE_STOP_FEED', self.router_STOP_FEED, "Stop feed filament (routed)"),
+                ('ACE_RETRACT', self.router_RETRACT, "Retract filament (routed)"),
+                ('ACE_UPDATE_RETRACT_SPEED', self.router_UPDATE_RETRACT_SPEED, "Update retracting speed (routed)"),
+                ('ACE_STOP_RETRACT', self.router_STOP_RETRACT, "Stop retract filament (routed)"),
+                ('ACE_CHANGE_TOOL', self.router_CHANGE_TOOL, "Change tool (routed)"),
+                ('ACE_FILAMENT_INFO', self.router_FILAMENT_INFO, "Show filament info (routed)"),
+            ]
+            for name, func, desc in commands:
+                self.gcode.register_command(name, func, desc=desc)
+            GLOBAL_COMMANDS_REGISTERED = True
 
         # Register per-instance namespaced drying commands to disambiguate multiple devices
         suffix = self._make_cmd_suffix(self._name)
@@ -156,6 +168,116 @@ class ValgAce:
             self.gcode.register_command(
                 f'ACE_STOP_DRYING_{suffix}', self.cmd_ACE_STOP_DRYING, desc=f"Stop drying ({self._name})"
             )
+
+    # ---- Global routing helpers ----
+    def _find_instance_by_global_index(self, g_index: int):
+        for inst in INSTANCE_REGISTRY:
+            if g_index >= inst.tool_offset and g_index < inst.tool_offset + inst.tool_slots:
+                return inst
+        return None
+
+    def _instance_and_local_index(self, g_index: int):
+        inst = self._find_instance_by_global_index(g_index)
+        if inst is None:
+            return None, None
+        return inst, g_index - inst.tool_offset
+
+    # Routers parse global index/tool, locate instance, and delegate
+    def router_FEED(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        length = gcmd.get_int('LENGTH', minval=1)
+        speed = gcmd.get_int('SPEED', self.feed_speed, minval=1)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_feed(index, length, speed, gcmd)
+
+    def router_UPDATE_FEEDING_SPEED(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        speed = gcmd.get_int('SPEED', self.feed_speed, minval=1)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_update_feeding_speed(index, speed, gcmd)
+
+    def router_STOP_FEED(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_stop_feed(index, gcmd)
+
+    def router_RETRACT(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        length = gcmd.get_int('LENGTH', minval=1)
+        speed = gcmd.get_int('SPEED', self.retract_speed, minval=1)
+        mode = gcmd.get_int('MODE', self.retract_mode, minval=0, maxval=1)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_retract(index, length, speed, mode, gcmd)
+
+    def router_UPDATE_RETRACT_SPEED(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        speed = gcmd.get_int('SPEED', self.feed_speed, minval=1)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_update_retract_speed(index, speed, gcmd)
+
+    def router_STOP_RETRACT(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_stop_retract(index, gcmd)
+
+    def router_PARK_TO_TOOLHEAD(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_park_to_toolhead(index, gcmd)
+
+    def router_ENABLE_FEED_ASSIST(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_enable_feed_assist(index, gcmd)
+
+    def router_DISABLE_FEED_ASSIST(self, gcmd):
+        idx_val = gcmd.get('INDEX', None)
+        if idx_val is None:
+            # Fallback: disable last index on each instance
+            for inst in INSTANCE_REGISTRY:
+                if inst._feed_assist_index >= 0:
+                    inst._do_disable_feed_assist(inst._feed_assist_index, gcmd)
+            return
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_disable_feed_assist(index, gcmd)
+
+    def router_FILAMENT_INFO(self, gcmd):
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        inst, index = self._instance_and_local_index(g_index)
+        if inst is None:
+            return
+        inst._do_filament_info(index, gcmd)
+
+    def router_CHANGE_TOOL(self, gcmd):
+        tool = gcmd.get_int('TOOL', minval=-1, maxval=255)
+        if tool == -1:
+            # broadcast to instances for deselect
+            for inst in INSTANCE_REGISTRY:
+                inst._do_change_tool(tool, gcmd)
+            return
+        for inst in INSTANCE_REGISTRY:
+            if tool >= inst.tool_offset and tool < inst.tool_offset + inst.tool_slots:
+                inst._do_change_tool(tool, gcmd)
+                return
 
     def _find_ace_device(self) -> Optional[str]:
         ACE_IDS = {
@@ -596,12 +718,13 @@ class ValgAce:
 
     def cmd_ACE_DISABLE_FEED_ASSIST(self, gcmd):
         # INDEX is global; if absent, fallback to last local assist index
-        g_index = gcmd.get_int('INDEX', None, minval=0, maxval=255)
-        if g_index is None:
+        idx_val = gcmd.get('INDEX', None)
+        if idx_val is None:
             index = self._feed_assist_index
             if index < 0:
                 return
         else:
+            g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
             if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
                 return
             index = g_index - self.tool_offset
@@ -743,9 +866,9 @@ class ValgAce:
         self.dwell(0.5, lambda: None)
 
     def cmd_ACE_CHANGE_TOOL(self, gcmd):
-        tool = gcmd.get_int('TOOL', minval=-1, maxval=3)
+        tool = gcmd.get_int('TOOL', minval=-1, maxval=255)
         # Read previously selected global tool for this device instance
-        current_tool_var = f"{self._name}_current_index"
+        current_tool_var = f"{self._make_cmd_suffix(self._name)}_current_index"
         was = self.variables.get(current_tool_var, -1)
 
         if was == tool:
@@ -825,7 +948,7 @@ class ValgAce:
         if not self.infinity_spool_mode:
             gcmd.respond_info("ACE_INFINITY_SPOOL disabled")
             return
-        current_tool_var = f"{self._name}_current_index"
+        current_tool_var = f"{self._make_cmd_suffix(self._name)}_current_index"
         was = self.variables.get(current_tool_var, -1)
         if was == -1:
             gcmd.respond_info("Tool is not set")
