@@ -6,7 +6,6 @@ GLOBAL_COMMANDS_REGISTERED = False
 
 import os
 import serial
-import serial.tools.list_ports
 import json
 import struct
 import queue
@@ -38,9 +37,10 @@ class ValgAce:
         self._write_timeout = config.getfloat('write_timeout', 0.5)
         self._max_queue_size = config.getint('max_queue_size', 20)
 
-        # Автопоиск устройства
-        default_serial = self._find_ace_device()
-        self.serial_name = config.get('serial', default_serial or '/dev/ttyACM0')
+        # Явное указание serial обязательно
+        self.serial_name = config.get('serial')
+        if not self.serial_name:
+            raise self.printer.config_error("ValgAce: 'serial' must be specified in the [ace] section")
         self.baud = config.getint('baud', 115200)
 
         # Параметры конфигурации
@@ -279,21 +279,7 @@ class ValgAce:
                 inst._do_change_tool(tool, gcmd)
                 return
 
-    def _find_ace_device(self) -> Optional[str]:
-        ACE_IDS = {
-            'VID:PID': [(0x28e9, 0x018a)],
-            'DESCRIPTION': ['ACE', 'BunnyAce', 'DuckAce']
-        }
-        for port in serial.tools.list_ports.comports():
-            if hasattr(port, 'vid') and hasattr(port, 'pid'):
-                if (port.vid, port.pid) in ACE_IDS['VID:PID']:
-                    print(f"Found ACE device by VID/PID at {port.device}")
-                    return port.device
-            if any(name in (port.description or '') for name in ACE_IDS['DESCRIPTION']):
-                print(f"Found ACE device by description at {port.device}")
-                return port.device
-        print("No ACE device found by auto-detection")
-        return None
+    
 
     def _connect_check(self, eventtime):
         if not self._connected:
