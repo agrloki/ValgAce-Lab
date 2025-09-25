@@ -21,7 +21,8 @@ class ValgAce:
         self.toolhead = None
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
-        self._name = 'ace'
+        # Use section name to namespace per-instance variables and commands
+        self._name = config.get_name()
         self.variables = self.printer.lookup_object('save_variables').allVariables
         self.read_buffer = bytearray()
         self.send_time = 0
@@ -47,6 +48,11 @@ class ValgAce:
         self.max_dryer_temperature = config.getint('max_dryer_temperature', 55)
         self.disable_assist_after_toolchange = config.getboolean('disable_assist_after_toolchange', True)
         self.infinity_spool_mode = config.getboolean('infinity_spool_mode', False)
+
+        # Global tool mapping (for multi-device setups)
+        # This device handles global tools in range [tool_offset, tool_offset + tool_slots - 1]
+        self.tool_offset = config.getint('tool_offset', 0)
+        self.tool_slots = config.getint('tool_slots', 4)
 
         # Состояние устройства
         self._info = self._get_default_info()
@@ -334,7 +340,7 @@ class ValgAce:
             payload = msg[4:4+payload_len]
             crc = struct.unpack('<H', msg[4+payload_len:4+payload_len+2])[0]
             if crc != self._calc_crc(payload):
-                return
+                continue
             try:
                 response = json.loads(payload.decode('utf-8'))
                 self._handle_response(response)
@@ -518,7 +524,10 @@ class ValgAce:
             gcmd.respond_raw(f"Error: {str(e)}")
 
     def cmd_ACE_FILAMENT_INFO(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         try:
             def callback(response):
                 if 'result' in response:
@@ -557,7 +566,10 @@ class ValgAce:
         self.send_request({"method": "drying_stop"}, callback)
 
     def cmd_ACE_ENABLE_FEED_ASSIST(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -568,7 +580,16 @@ class ValgAce:
         self.send_request({"method": "start_feed_assist", "params": {"index": index}}, callback)
 
     def cmd_ACE_DISABLE_FEED_ASSIST(self, gcmd):
-        index = gcmd.get_int('INDEX', self._feed_assist_index, minval=0, maxval=3)
+        # INDEX is global; if absent, fallback to last local assist index
+        g_index = gcmd.get_int('INDEX', None, minval=0, maxval=255)
+        if g_index is None:
+            index = self._feed_assist_index
+            if index < 0:
+                return
+        else:
+            if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+                return
+            index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -602,16 +623,22 @@ class ValgAce:
         if self._park_in_progress:
             gcmd.respond_raw("Already parking to toolhead")
             return
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         if self._info['slots'][index]['status'] != 'ready':
             self.gcode.run_script_from_command(f"_ACE_ON_EMPTY_ERROR INDEX={index}")
             return
         self._park_to_toolhead(index)
 
     def cmd_ACE_FEED(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
         length = gcmd.get_int('LENGTH', minval=1)
         speed = gcmd.get_int('SPEED', self.feed_speed, minval=1)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -622,8 +649,11 @@ class ValgAce:
         self.dwell((length / speed) + 0.1, lambda: None)
 
     def cmd_ACE_UPDATE_FEEDING_SPEED(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
         speed = gcmd.get_int('SPEED', self.feed_speed, minval=1)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -634,7 +664,10 @@ class ValgAce:
         self.dwell(0.5, lambda: None)
 
     def cmd_ACE_STOP_FEED(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -647,10 +680,13 @@ class ValgAce:
         self.dwell(0.5, lambda: None)
 
     def cmd_ACE_RETRACT(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
         length = gcmd.get_int('LENGTH', minval=1)
         speed = gcmd.get_int('SPEED', self.retract_speed, minval=1)
         mode = gcmd.get_int('MODE', self.retract_mode, minval=0, maxval=1)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -661,8 +697,11 @@ class ValgAce:
         self.dwell((length / speed) + 0.1, lambda: None)
 
     def cmd_ACE_UPDATE_RETRACT_SPEED(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
         speed = gcmd.get_int('SPEED', self.feed_speed, minval=1)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -673,7 +712,10 @@ class ValgAce:
         self.dwell(0.5, lambda: None)
 
     def cmd_ACE_STOP_RETRACT(self, gcmd):
-        index = gcmd.get_int('INDEX', minval=0, maxval=3)
+        g_index = gcmd.get_int('INDEX', minval=0, maxval=255)
+        if g_index < self.tool_offset or g_index >= self.tool_offset + self.tool_slots:
+            return
+        index = g_index - self.tool_offset
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
@@ -687,37 +729,48 @@ class ValgAce:
 
     def cmd_ACE_CHANGE_TOOL(self, gcmd):
         tool = gcmd.get_int('TOOL', minval=-1, maxval=3)
-        was = self.variables.get('ace_current_index', -1)
+        # Read previously selected global tool for this device instance
+        current_tool_var = f"{self._name}_current_index"
+        was = self.variables.get(current_tool_var, -1)
 
         if was == tool:
             gcmd.respond_info(f"Tool already set to {tool}")
             return
 
-        if tool != -1 and self._info['slots'][tool]['status'] != 'ready':
-            self.gcode.run_script_from_command(f"_ACE_ON_EMPTY_ERROR INDEX={tool}")
+        # If requested tool is outside of this device's range, ignore the command
+        if tool != -1:
+            if tool < self.tool_offset or tool >= self.tool_offset + self.tool_slots:
+                return
+
+        # Map global tool index to local device slot 0..(tool_slots-1)
+        local_tool = -1 if tool == -1 else (tool - self.tool_offset)
+        local_was = -1 if was == -1 else (was - self.tool_offset)
+
+        if local_tool != -1 and self._info['slots'][local_tool]['status'] != 'ready':
+            self.gcode.run_script_from_command(f"_ACE_ON_EMPTY_ERROR INDEX={local_tool}")
             return
 
         self.gcode.run_script_from_command(f"_ACE_PRE_TOOLCHANGE FROM={was} TO={tool}")
         self._park_is_toolchange = True
-        self._park_previous_tool = was
+        self._park_previous_tool = local_was
 
         if self.toolhead is None:
             gcmd.respond_raw("Toolhead not ready")
             return
 
         self.toolhead.wait_moves()
-        self.variables['ace_current_index'] = tool
-        self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={tool}')
+        self.variables[current_tool_var] = tool
+        self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE={current_tool_var} VALUE={tool}')
 
         def callback(response):
             if response.get('code', 0) != 0:
                 gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
 
-        if was != -1:
+        if local_was != -1:
             self.send_request({
                 "method": "unwind_filament",
                 "params": {
-                    "index": was,
+                    "index": local_was,
                     "length": self.toolchange_retract_length,
                     "speed": self.retract_speed
                 }
@@ -725,13 +778,20 @@ class ValgAce:
             self.dwell((self.toolchange_retract_length / self.retract_speed) + 0.1, lambda: None)
             self.dwell(1.0, lambda: None)
 
-            if tool != -1:
-                # Ждём готовности старого слота
-                self._wait_for_slot_ready(was, lambda: self._proceed_with_toolchange(tool, was, gcmd), self.reactor.NOW)
+            if local_tool != -1:
+                # Ждём готовности старого слота (локальный индекс)
+                self.reactor.register_timer(
+                    lambda et: self._wait_for_slot_ready(
+                        local_was,
+                        lambda: self._proceed_with_toolchange(local_tool, local_was, gcmd),
+                        et
+                    ),
+                    self.reactor.NOW
+                )
             else:
-                self._proceed_with_toolchange(tool, was, gcmd)
+                self._proceed_with_toolchange(local_tool, local_was, gcmd)
         else:
-            self._park_to_toolhead(tool)
+            self._park_to_toolhead(local_tool)
 
     def _proceed_with_toolchange(self, tool, was, gcmd):
         self._park_to_toolhead(tool)
@@ -750,18 +810,22 @@ class ValgAce:
         if not self.infinity_spool_mode:
             gcmd.respond_info("ACE_INFINITY_SPOOL disabled")
             return
-        was = self.variables.get('ace_current_index', -1)
+        current_tool_var = f"{self._name}_current_index"
+        was = self.variables.get(current_tool_var, -1)
         if was == -1:
             gcmd.respond_info("Tool is not set")
             return
 
-        # Найти следующий доступный слот
-        next_tool = None
-        for i in range(4):
-            if i != was and self._info['slots'][i]['status'] == 'ready':
-                next_tool = i
+        # Преобразуем в локальный индекс для этого устройства
+        local_was = -1 if was == -1 else (was - self.tool_offset)
+
+        # Найти следующий доступный локальный слот
+        next_local = None
+        for i in range(self.tool_slots):
+            if i != local_was and self._info['slots'][i]['status'] == 'ready':
+                next_local = i
                 break
-        if next_tool is None:
+        if next_local is None:
             gcmd.respond_info("No ready spool available")
             return
 
@@ -769,14 +833,19 @@ class ValgAce:
         if self.toolhead:
             self.toolhead.wait_moves()
 
-        self._park_to_toolhead(next_tool)
+        self._park_to_toolhead(next_local)
         self.dwell(15.0, lambda: None)
-        self.gcode.run_script_from_command(f'__ACE_POST_INFINITYSPOOL')
+        self.gcode.run_script_from_command(f'_ACE_POST_INFINITYSPOOL')
         self.toolhead.wait_moves()
-        self.variables['ace_current_index'] = next_tool
-        self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE=ace_current_index VALUE={next_tool}')
-        gcmd.respond_info(f"Tool changed from {was} to {next_tool}")
+        next_global = self.tool_offset + next_local
+        self.variables[current_tool_var] = next_global
+        self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE={current_tool_var} VALUE={next_global}')
+        gcmd.respond_info(f"Tool changed from {was} to {next_global}")
 
 
 def load_config(config):
+    return ValgAce(config)
+
+def load_config_prefix(config):
+    # Allow multiple instances via sections like [ace], [ace second], [ace foo]
     return ValgAce(config)
