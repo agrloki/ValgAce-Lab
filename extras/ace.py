@@ -64,6 +64,7 @@ class ValgAce:
         self._park_start_time = 0.0
         # Таймеры
         self._park_timeout_timer = None
+        self._toolchange_timeout_timer = None
         self._request_timeout_timers = {}
         # Очереди задач
         self._queue = queue.Queue(maxsize=self._max_queue_size)
@@ -631,40 +632,72 @@ class ValgAce:
     #     pass
 
 
+    def _handle_toolchange_error(self, error_msg, original_tool):
+        """Восстанавливает состояние при ошибке смены инструмента"""
+        self.gcode.respond_raw(f"[ACE] Toolchange error: {error_msg}, reverting to tool {original_tool}")
+        
+        # Восстанавливаем переменную текущего инструмента
+        if self._name.startswith("ace "):
+            suffix = self._name[4:]
+        else:
+            suffix = self._name
+        safe_suffix = ''.join(ch if ch.isalnum() else '_' for ch in suffix).lower()
+        current_tool_var = f"{safe_suffix}_current_index"
+        self.variables[current_tool_var] = original_tool
+        self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE={current_tool_var} VALUE={original_tool}')
+        
+        # Останавливаем все активные операции
+        if self._park_in_progress:
+            self._complete_parking(success=False, error=error_msg)
+    
     def _complete_parking(self, success=True, error=None):
-        self.gcode.respond_info(f"// [ACE] _complete_parking: Called with success={success}, error={error}") # Debug
+        self.gcode.respond_info(f"[ACE] _complete_parking: Called with success={success}, error={error}")
         if not self._park_in_progress:
-            self.gcode.respond_raw(f"!! [ACE] _complete_parking: Warning: Called but _park_in_progress is False. Ignoring.") # Debug
+            self.gcode.respond_raw(f"[ACE] _complete_parking: Warning: Called but _park_in_progress is False. Ignoring.")
             return
-        # if self._park_timeout_timer: # УБРАНО: таймер больше не используется
-        #     print(f"[ACE] _complete_parking: Unregistering park timeout timer.") # Debug
-        #     self.reactor.unregister_timer(self._park_timeout_timer)
-        #     self._park_timeout_timer = None
-        self.gcode.respond_info(f"// [ACE] _complete_parking: Stopping feed assist for slot {self._park_index}.") # Debug
+        
+        self.gcode.respond_info(f"[ACE] _complete_parking: Stopping feed assist for slot {self._park_index}.")
         try:
             if success:
-                self.gcode.respond_info(f"// [ACE] _complete_parking: Sending stop_feed_assist command.") # Debug
+                self.gcode.respond_info(f"[ACE] _complete_parking: Sending stop_feed_assist command.")
                 self.send_request({
                     "method": "stop_feed_assist",
                     "params": {"index": self._park_index}
-                }, lambda r: self.gcode.respond_info(f"// [ACE] _complete_parking: stop_feed_assist command sent, response: {r}")) # Debug callback
+                }, lambda r: self.gcode.respond_info(f"[ACE] _complete_parking: stop_feed_assist command sent, response: {r}"))
             else:
-                self.gcode.respond_info(f"// [ACE] _complete_parking: Parking failed ({error}), still sending stop_feed_assist command as a safety measure.") # Debug
+                self.gcode.respond_info(f"[ACE] _complete_parking: Parking failed ({error}), still sending stop_feed_assist command as a safety measure.")
                 self.send_request({
                     "method": "stop_feed_assist",
                     "params": {"index": self._park_index}
-                }, lambda r: self.gcode.respond_info(f"// [ACE] _complete_parking (fail): stop_feed_assist command sent, response: {r}")) # Debug callback
+                }, lambda r: self.gcode.respond_info(f"[ACE] _complete_parking (fail): stop_feed_assist command sent, response: {r}"))
         except Exception as e:
-            self.gcode.respond_raw(f"!! [ACE] _complete_parking: Error sending stop_feed_assist: {str(e)}") # Debug
+            self.gcode.respond_raw(f"[ACE] _complete_parking: Error sending stop_feed_assist: {str(e)}")
         finally:
-            self.gcode.respond_info(f"// [ACE] _complete_parking: Resetting parking flags.") # Debug
+            # Отменяем таймер таймаута смены инструмента
+            if hasattr(self, '_toolchange_timeout_timer') and self._toolchange_timeout_timer:
+                self.reactor.unregister_timer(self._toolchange_timeout_timer)
+                self._toolchange_timeout_timer = None
+            
+            self.gcode.respond_info(f"[ACE] _complete_parking: Resetting parking flags.")
             self._park_in_progress = False
+            # Сохраняем значения для использования в пост-обработке
+            is_toolchange = self._park_is_toolchange
+            prev_tool = self._park_previous_tool
+            curr_tool = self._park_index
             self._park_is_toolchange = False
             self._park_previous_tool = -1
             self._park_index = -1
             if self.disable_assist_after_toolchange:
                 self._feed_assist_index = -1
-        self.gcode.respond_info(f"// [ACE] _complete_parking: Finished.") # Debug
+        self.gcode.respond_info(f"[ACE] _complete_parking: Finished.")
+        
+        # Если это была смена инструмента, выполняем post-change команду
+        if is_toolchange and success:
+            try:
+                self.gcode.run_script_from_command(f'_ACE_POST_TOOLCHANGE FROM={prev_tool} TO={curr_tool}')
+            except Exception as e:
+                self.gcode.respond_info(f"[ACE] Error in post toolchange: {e}")
+                traceback.print_exc()
 
                 
     def dwell(self, delay: float = 1.0, callback: Optional[Callable] = None):
@@ -980,24 +1013,102 @@ class ValgAce:
             return
         self._park_to_toolhead(index)
         
-    def _wait_for_slot_ready(self, index, on_ready):
+    def _wait_for_slot_ready(self, index, on_ready, timeout=None):
+        if timeout is None:
+            timeout = self.SLOT_READY_TIMEOUT
         start_time = self.reactor.monotonic()
+        
         def check_func(eventtime):
             try:
+                # Получаем обновленное состояние через запрос статуса
+                self._request_status()
+                
                 if self._info['slots'][index]['status'] == 'ready':
+                    self.gcode.respond_info(f"[ACE] Slot {index} is ready, proceeding with operation")
                     on_ready()
                     return self.reactor.NEVER
-                if eventtime - start_time > self.SLOT_READY_TIMEOUT:
-                    self.gcode.respond_raw(f"[ACE] Timeout waiting for slot {index}. Forcing proceed.")
-                    on_ready()
+                if eventtime - start_time > timeout:
+                    self.gcode.respond_raw(f"[ACE] Timeout waiting for slot {index} to become ready")
+                    self.gcode.respond_info(f"[ACE] Current status of slot {index}: {self._info['slots'][index]['status']}")
+                    on_ready()  # Продолжаем выполнение даже при таймауте
                     return self.reactor.NEVER
-                return eventtime + 0.5
+                return eventtime + 0.2  # Проверяем чаще
             except Exception as e:
                 self.gcode.respond_info(f"Error in _wait_for_slot_ready: {str(e)}")
                 traceback.print_exc()
                 return self.reactor.NEVER
-        return check_func
+        
+        return self.reactor.register_timer(check_func, self.reactor.NOW)
     
+    def _perform_retract_for_toolchange(self, local_was, local_tool, gcmd):
+        """Выполняет ретракт старого инструмента и затем подачу нового"""
+        # Устанавливаем флаги смены инструмента
+        self._park_is_toolchange = True
+        self._park_previous_tool = local_was
+        
+        def callback(response):
+            try:
+                if response.get('code', 0) != 0:
+                    gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
+                    return
+            except Exception as e:
+                self.gcode.respond_info(f"Unwind callback error: {str(e)}")
+        
+        # Отправляем команду ретракта
+        self.send_request({
+            "method": "unwind_filament",
+            "params": {
+                "index": local_was,
+                "length": self.toolchange_retract_length,
+                "speed": self.retract_speed
+            }
+        }, callback)
+        
+        # После завершения ретракта переходим к подаче нового инструмента
+        def proceed_after_retract():
+            if local_tool != -1:
+                # Ждем, пока старый слот станет готов
+                check_timer = self._wait_for_slot_ready(local_was,
+                    lambda: self._start_feed_for_toolchange(local_tool, gcmd))
+                self.reactor.register_timer(check_timer, self.reactor.NOW)
+            else:
+                self._start_feed_for_toolchange(local_tool, gcmd)
+        
+        # Ожидаем завершения ретракта перед продолжением
+        self.dwell((self.toolchange_retract_length / self.retract_speed) + 0.5, proceed_after_retract)
+    
+    def _start_toolchange_timeout(self):
+        """Запускает таймер таймаута для всей операции смены инструмента"""
+        def timeout_handler(eventtime):
+            if self._park_in_progress and self._park_is_toolchange:
+                self.gcode.respond_raw(f"[ACE] Toolchange timeout - cancelling operation")
+                self._complete_parking(success=False, error="Toolchange timeout")
+            return self.reactor.NEVER
+        
+        wake_time = self.reactor.monotonic() + 45.0  # 45 секунд таймаут
+        self._toolchange_timeout_timer = self.reactor.register_timer(timeout_handler, wake_time)
+    
+    def _start_feed_for_toolchange(self, local_tool, gcmd):
+        """Начинает подачу нового инструмента"""
+        if local_tool != -1:
+            # Устанавливаем флаги смены инструмента (если они еще не установлены)
+            if not self._park_is_toolchange:
+                self._park_is_toolchange = True
+                # _park_previous_tool должен быть установлен в _perform_retract_for_toolchange
+                # или в cmd_ACE_CHANGE_TOOL, если это первая операция в смене инструмента
+            
+            self._park_to_toolhead(local_tool)
+            
+            def post_change_callback():
+                try:
+                    self.gcode.run_script_from_command(f'_ACE_POST_TOOLCHANGE FROM={self._park_previous_tool} TO={local_tool}')
+                except Exception as e:
+                    self.gcode.respond_info(f"[ACE] Error in _start_feed_for_toolchange: {e}")
+                    traceback.print_exc()
+            
+            # Ожидаем завершения парковки
+            self.dwell(20.0, post_change_callback)  # Увеличенное время ожидания
+        
     def _proceed_with_toolchange(self, tool, was, gcmd):
         self._park_to_toolhead(tool)
         def callback():
@@ -1010,13 +1121,14 @@ class ValgAce:
         
     def cmd_ACE_CHANGE_TOOL(self, gcmd):
         tool = gcmd.get_int('TOOL', minval=-1, maxval=255)
+        self.gcode.respond_info(f"[ACE] Starting tool change to TOOL={tool}")
+        
         if self._name.startswith("ace "):
             suffix = self._name[4:]
         else:
             suffix = self._name
         safe_suffix = ''.join(ch if ch.isalnum() else '_' for ch in suffix).lower()
-        current_tool_var = f"{safe_suffix}_current_index"    
- #       current_tool_var = f"{self._make_cmd_suffix(self._name)}_current_index"
+        current_tool_var = f"{safe_suffix}_current_index"
         was = self.variables.get(current_tool_var, -1)
         if was == tool:
             gcmd.respond_info(f"Tool already set to {tool}")
@@ -1029,39 +1141,23 @@ class ValgAce:
         if local_tool != -1 and self._info['slots'][local_tool]['status'] != 'ready':
             self.gcode.run_script_from_command(f"_ACE_ON_EMPTY_ERROR INDEX={local_tool}")
             return
+        
+        self.gcode.respond_info(f"[ACE] Tool change initiated: was={was}, now={tool}")
         self.gcode.run_script_from_command(f"_ACE_PRE_TOOLCHANGE FROM={was} TO={tool}")
-        self._park_is_toolchange = True
-        self._park_previous_tool = local_was
-        if self.toolhead is None:
-            gcmd.respond_raw("Toolhead not ready")
-            return
-        self.toolhead.wait_moves()
+        
+        # Сохраняем текущий инструмент
         self.variables[current_tool_var] = tool
         self.gcode.run_script_from_command(f'SAVE_VARIABLE VARIABLE={current_tool_var} VALUE={tool}')
-        def callback(response):
-            try:
-                if response.get('code', 0) != 0:
-                    gcmd.respond_raw(f"ACE Error: {response.get('msg', 'Unknown error')}")
-            except Exception as e:
-                self.gcode.respond_info(f"Unwind callback error: {str(e)}")
+        
+        # Запускаем таймер таймаута смены инструмента
+        self._start_toolchange_timeout()
+        
+        # Сначала ретракт старого инструмента
         if local_was != -1:
-            self.send_request({
-                "method": "unwind_filament",
-                "params": {
-                    "index": local_was,
-                    "length": self.toolchange_retract_length,
-                    "speed": self.retract_speed
-                }
-            }, callback)
-            self.dwell((self.toolchange_retract_length / self.retract_speed) + 0.1, None)
-            self.dwell(1.0, None)
-            if local_tool != -1:
-                check_timer = self._wait_for_slot_ready(local_was, lambda: self._proceed_with_toolchange(local_tool, local_was, gcmd))
-                self.reactor.register_timer(check_timer, self.reactor.NOW)
-            else:
-                self._proceed_with_toolchange(local_tool, local_was, gcmd)
+            self._perform_retract_for_toolchange(local_was, local_tool, gcmd)
         else:
-            self._park_to_toolhead(local_tool)
+            # Если нет предыдущего инструмента, сразу переходим к подаче
+            self._start_feed_for_toolchange(local_tool, gcmd)
 def load_config(config):
     return ValgAce(config)
 def load_config_prefix(config):
